@@ -31,7 +31,9 @@ from GeodesicMotionSkills.Experiments.Utils.environment import Environment
 from stochman.manifold import EmbeddedManifold
 from stochman import nnj
 import copy
-
+from neural_network import NeuralNetwork
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
 
 class VAE(nn.Module, EmbeddedManifold):
 
@@ -59,7 +61,7 @@ class VAE(nn.Module, EmbeddedManifold):
 
         # Hyper-parameters
         self.plot_number = "0"  # Automatically Set
-        self.device = 'cpu'
+        self.device = 'cuda'
         self.batch_size = batch_size
         self.kl_coeff = 1.0  # Automatically Set
         self.kl_coeff_max = 1.0
@@ -160,7 +162,7 @@ class VAE(nn.Module, EmbeddedManifold):
             m = torch.einsum("bji,bjk->bik", j_mu, j_mu)
             m2 = torch.einsum("bji,bjk->bik", j_std.squeeze(0), j_std.squeeze(0))
             m3 = torch.einsum("bji,bjk->bik", j_std_qua.squeeze(0), j_std_qua.squeeze(0))
-            metric = (m3 + m2 + m).detach().numpy()
+            metric = (m3 + m2 + m) # MODIFIED : metric = (m3 + m2 + m).detach().numpy()
         else:
             mu_pos, mu_qua = self.decode(points, train_rbf=True, jacobian=False)  # BxNxD, BxNxDx(d)
             std = self.dec_std_pos(points, jacobian=False)  # BxNxD, BxNxDx(d)
@@ -255,6 +257,10 @@ class VAE(nn.Module, EmbeddedManifold):
             module.training = False
         # self.encoder_loc.disable_training()
         # self.decoder_loc.disable_training()
+    
+    def disable_encoder_training(self):
+        for module in self.encoder_loc._modules.values():
+            module.training = False
 
     def init_std(self, x, load_clusters=False):
         """ initializing the RBF networks
@@ -270,8 +276,8 @@ class VAE(nn.Module, EmbeddedManifold):
         d = z.shape[1]
         inv_max_std = np.sqrt(1e-12)  # 1.0 / x.std()
         beta = 10.0 / z.std(dim=0).mean()  # 1.0
-        rbf_beta = beta * torch.ones(1, self.num_clusters)
-        k_means = KMeans(n_clusters=self.num_clusters).fit(z.numpy())
+        rbf_beta = beta * torch.ones(1, self.num_clusters).to(self.device)
+        k_means = KMeans(n_clusters=self.num_clusters).fit(z.cpu().numpy())
         if load_clusters:
             k_means = pickle.load(open("../Clusters/" + "clusters.p", "rb"))
         else:
@@ -349,6 +355,109 @@ def loss_function_elbo(x, model, train_rbf, n_samples):
     log_mean = torch.mean(log_p, dim=0)
     return -elbo, kl, log_mean
 
+def visualize_sampling_points(vector_field, sampling_points):
+    plt.figure(figsize=(10, 10))
+
+    for i in range(20):
+        magnitude = np.sqrt(vector_field[i][0]**2 + vector_field[i][1]**2)
+        u_normalized = vector_field[i][0] / magnitude
+        v_normalized = vector_field[i][1] / magnitude
+        plt.quiver(sampling_points[i][0], sampling_points[i][1], u_normalized, v_normalized, color='r')
+    
+    tj_1 = np.load('../latent_trajectory/toy_example/latent_trajectories_0.npy')
+    tj_2 = np.load('../latent_trajectory/toy_example/latent_trajectories_n_0.npy')
+
+    for i in range(len(tj_1)):
+        plt.scatter(tj_1[i][0], tj_1[i][1], color='b')
+        plt.scatter(tj_2[i][0], tj_2[i][1], color='b')
+
+    plt.xlim(-8, 8)
+    plt.ylim(-8, 8)
+
+    plt.grid(True)
+    plt.show()
+
+
+def loss_function_cossim(condor_model, model, primitive_type, z_samples):
+    F = condor_model.decoder_dx(condor_model.encoder(z_samples, primitive_type))  # Vector field
+    _, _, G = model.embed(z_samples, jacobian=True)  # Metric tensor G(x)
+
+    # Calculate eigenvalues and eigenvectors using torch.eig
+    eigenvalues, eigenvectors = torch.linalg.eig(G)
+
+    # Get the real part of the eigenvalues and eigenvectors (since they might be complex)
+    eigenvalues = eigenvalues.real
+    eigenvectors = eigenvectors.real
+    
+    # Find the indices of the minimum eigenvalue for each matrix
+    min_eigenval_indices = eigenvalues.argmin(dim=-1)
+    
+    # Gather the corresponding eigenvectors
+    min_eigenvectors = torch.stack([eigenvectors[i, :, min_eigenval_indices[i]] for i in range(G.size(0))])
+
+    # Normalize the vectors to make them unit vectors
+    min_eigenvectors_norm = min_eigenvectors / (torch.norm(min_eigenvectors, dim=1, keepdim=True) + 1e-8)
+    F_norm = F / (torch.norm(F, dim=1, keepdim=True) + 1e-8)
+
+    # Compute cosine similarity
+    cosine_similarity = torch.sum(min_eigenvectors_norm * F_norm, dim=-1)
+
+    # Compute loss (1 - cosine similarity)
+    cossim_loss = 1 - cosine_similarity
+
+    return cossim_loss.mean()
+
+
+def loss_function_contract(condor_model, model, primitive_type, z_samples, c):
+    """
+    Compute the contraction loss based on sampled points in the latent space.
+    :param F_net: The neural network representing the vector field F(x).
+    :param G_net: The neural network or function representing the Riemannian metric tensor G(x).
+    :param x_samples: A batch of points sampled from the latent space.
+    :param c: The contraction constant.
+    :return: The contraction loss value.
+    """
+    F_bf = condor_model.decoder_dx(condor_model.encoder(z_samples, primitive_type))  # Vector field
+    F_norm = torch.norm(F_bf, dim=1, keepdim=True)
+    F = F_bf / (F_norm + 1e-8) # Normalized vector field F(x)
+
+    _, _, G = model.embed(z_samples, jacobian=True)  # Metric tensor G(x)
+
+    # mg_metric = torch.log(torch.sqrt(torch.abs(torch.linalg.det(G))))
+    # var_mg = torch.var(mg_metric)
+
+    # Visualize sampling points and their corresponding vector fields
+    # visualize_sampling_points(F.detach().to('cpu').numpy(), z_samples.detach().to('cpu').numpy())
+
+    # Initialize the Jacobian matrix DF(z)
+    DF = torch.zeros(z_samples.size(0), F.size(1), z_samples.size(1), device=z_samples.device)
+    
+    # Compute the Jacobian DF(z) of F(z) with respect to z_samples
+    for i in range(F.size(1)):
+        grad_F_i = torch.autograd.grad(outputs=F[:, i], inputs=z_samples,
+                                       grad_outputs=torch.ones_like(F[:, i]),
+                                       create_graph=True, retain_graph=True, only_inputs=True)[0]
+        DF[:, i, :] = grad_F_i
+
+    # Compute the Lie derivative of the metric tensor G along F
+    LF_G = torch.zeros_like(G)
+    for i in range(G.size(1)):
+        for j in range(G.size(2)):
+            grad_G_ij = torch.autograd.grad(G[:, i, j].sum(), z_samples, create_graph=True)[0]
+            LF_G[:, i, j] = torch.sum(F * grad_G_ij, dim=1)
+
+    # Generalized Demidovich condition: G(x)DF(x) + DF(x)⊤G(x) + LF G(x) + 2cG(x)
+    DF_G = torch.bmm(G, DF)  # G(x) * DF(x)
+    DF_G_T = torch.bmm(DF.transpose(1, 2), G)  # DF(x)^T * G(x)
+    contraction_matrix = DF_G + DF_G_T + LF_G + 2 * c * G
+    
+    # Compute the loss using the ReLU of the largest eigenvalue
+    eigenvalues, _ = torch.linalg.eig(contraction_matrix)  # Compute eigenvalues
+    max_eigenvalue = eigenvalues.real.max(dim=1)[0]  # Largest real part of eigenvalues
+
+    loss = torch.relu(max_eigenvalue).mean()  # Only penalize if eigenvalue > 0
+    
+    return loss
 
 def train(model, optimizer, loss_function, data_loader, epoch, device, train_rbf):
     """ Training the model
@@ -376,6 +485,7 @@ def train(model, optimizer, loss_function, data_loader, epoch, device, train_rbf
         batch_loss, loss_kl, loss_log = loss_function(data, train_rbf)
         batch_loss.backward()
         optimizer.step()
+        print(f'Epoch [{epoch+1}/{epochs}], Batch [{batch_idx+1}], ELBO Loss: {batch_loss.item():.4f}, ')
     print('Training ====> Epoch: {}/{}'.format(epoch, epochs))
 
 
@@ -421,6 +531,113 @@ def train_model():
                         'repetition': repetition,
                         'encoder_scale': encoder_scale}, fn)
 
+def train_contract_model():
+    """ Training the VAE decoder with contract loss
+    Inputs:
+        none
+    Outputs:
+        none
+    """
+    # Load the CONDOR model
+    workspace_dimensions = 2
+    dynamical_system_order = 1
+    dim_state = workspace_dimensions * dynamical_system_order
+    n_primitives = 2
+    multi_motion = True
+    latent_gain_lower_limit = 0 
+    latent_gain_upper_limit = 0.0997 
+    latent_gain = 0.008 
+    latent_space_dim = 300
+    neurons_hidden_layers = 300 
+    adaptive_gains = True 
+    
+    condor_model = NeuralNetwork(dim_state=dim_state,
+                                 dynamical_system_order=dynamical_system_order,
+                                 n_primitives=n_primitives,
+                                 multi_motion=multi_motion,
+                                 latent_gain_lower_limit=latent_gain_lower_limit,
+                                 latent_gain_upper_limit=latent_gain_upper_limit,
+                                 latent_gain=latent_gain,
+                                 latent_space_dim=latent_space_dim,
+                                 neurons_hidden_layers=neurons_hidden_layers,
+                                 adaptive_gains=adaptive_gains).cuda()
+
+    condor_model_path = '/home/sunho/research/csr_repo/Stable-Motion-Primitives-via-Imitation-and-Contrastive-Learning/src/results/toy/0,1/'
+    condor_model.load_state_dict(torch.load(condor_model_path + 'model', weights_only=False), strict=False)
+    
+    # Freeze the condor_model parameters to prevent training
+    for param in condor_model.parameters():
+        param.requires_grad = False
+    
+    # Load the torch VAE model
+    files = glob.glob(model_path + '/*.pt')
+    for fn in files:
+        model = VAE(layers=[dof, 200, 100, 2], batch_size=batch_size, sigma_z=encoder_scales[0]).to(device)
+        model.obstacle_input_space = None
+        model.init_std(train_data.tensors[0].float().to(device), load_clusters=True)
+        checkpoint = torch.load(fn, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        encoder_scale = checkpoint['encoder_scale']
+        model.to(device)
+        model.disable_encoder_training()
+    
+    gamma = 1e-11
+    latent_sample_std = 5   
+    num_z_samples = 2500
+    for encoder_scale in encoder_scales:
+        for repetition in range(repetitions):
+            # Train RBF/Variance networks
+            params = list(model.encoder_scale.parameters()) + list(model.dec_std_qua.parameters()) + list(model.dec_std_pos.parameters())
+            optimizer = torch.optim.Adam(params, lr=learning_rate)
+
+            model.activate_KL = False
+            model.kl_coeff = 0.1
+            
+            for epoch in range(int(epochs)):
+                for batch_idx, (data,) in enumerate(train_loader):
+                    data = data.to(device)
+                    
+                    if data.shape[0] != batch_size:
+                        break
+
+                    optimizer.zero_grad()
+
+                    # Calculate the ELBO loss
+                    elbo_loss, _, _ = loss_function_elbo(data, model, train_rbf=True, n_samples=n_samples)
+
+                    # Sample random points in the latent space                   
+                    z_samples = torch.randn((num_z_samples, 2), device=device, requires_grad=True) * latent_sample_std
+
+                    # Randomly sample primitive_type values between 0 and n_primitives - 1
+                    primitive_type = torch.randint(0, n_primitives, (num_z_samples,), device=device)
+
+                    # Calculate contraction loss  
+                    # contract_loss = loss_function_contract(condor_model, model, primitive_type, z_samples, c=0.05)
+
+                    # Calculate cossim loss
+                    cossim_loss = loss_function_cossim(condor_model, model, primitive_type, z_samples)
+
+                    # Combine losses
+                    total_loss = gamma * elbo_loss + cossim_loss
+                    #total_loss.backward()
+                    total_loss.backward()
+                    optimizer.step()
+
+                    writer.add_scalar("cossim_loss", cossim_loss, epoch * len(train_loader) + batch_idx)
+                    writer.add_scalar("elbo_loss", elbo_loss, epoch * len(train_loader) + batch_idx)
+                    writer.add_scalar("total_loss", total_loss, epoch * len(train_loader) + batch_idx)
+                    # print(f'Epoch [{epoch+1}/{epochs}], Batch [{batch_idx+1}], ELBO Loss: {elbo_loss.item():.4f}, '
+                    #       f'Contract Loss: {contract_loss.item():.4f}, Total Loss: {total_loss.item():.4f}')
+                writer.flush()
+
+            # Saving the model into a file
+            fn = model_path + '/final' + '/vae_loss%s_ns%d_es%f_r%d.pt' % (loss, n_samples, encoder_scale, repetition)
+            print('Saving model:', fn)
+            torch.save({'epoch': epoch,
+                        'model_state_dict': model.to('cpu').state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'repetition': repetition,
+                        'encoder_scale': encoder_scale}, fn)
 
 def test_model():
     """ Testing the learned Riemannian manifold by evaluating the metric and geodesic computation
@@ -429,14 +646,14 @@ def test_model():
     Outputs:
         none
     """
-    files = glob.glob(model_path + '/*.pt')
+    files = glob.glob(model_path + '/final' + '/*.pt')
 
     # Load the torch model
     for fn in files:
         model = VAE(layers=[dof, 200, 100, 2], batch_size=batch_size, sigma_z=encoder_scales[0]).to(device)
         model.obstacle_input_space = None
         model.init_std(train_data.tensors[0].float(), load_clusters=True)
-        checkpoint = torch.load(fn)
+        checkpoint = torch.load(fn, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         encoder_scale = checkpoint['encoder_scale']
         model.to(device)
@@ -456,6 +673,43 @@ def test_model():
     plot(model, var_measure, mag_fac, geodesic)
     model.env.step()
 
+def save_latent_trajectory():
+    """ Saves the trajectory of latent variables genereated by the VAE encoder.
+    Inputs:
+        none
+    Outputs:
+        none
+    """
+    files = glob.glob(model_path + '/*.pt')
+
+    # Load the torch model
+    for fn in files:
+        model = VAE(layers=[dof, 200, 100, 2], batch_size=batch_size, sigma_z=encoder_scales[0]).to(device)
+        model.obstacle_input_space = None
+        model.init_std(train_data.tensors[0].float().to(device), load_clusters=True)
+        checkpoint = torch.load(fn, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        encoder_scale = checkpoint['encoder_scale']
+        model.to(device)
+        model.disable_training()
+    
+    for i in range(trajectory_number):
+        input_trajectory = torch.tensor(trajectory_stacked[i], dtype=torch.float32).to(device)
+        z_distribution, _ = model.encode(input_trajectory , train_rbf=False)
+        z_mean = z_distribution.mean.detach().cpu().numpy()  # Extract mean of latent space distribution
+        latent_trajectory = z_mean  # Store the result
+    
+        save_path = f"{model_path}/../latent_trajectory/toy_example/latent_trajectories_{i}.npy"
+        np.save(save_path, latent_trajectory)
+
+    for i in range(trajectory_number):
+        input_trajectory = torch.tensor(trajectory_stacked_n[i], dtype=torch.float32).to(device)
+        z_distribution, _ = model.encode(input_trajectory , train_rbf=False)
+        z_mean = z_distribution.mean.detach().cpu().numpy()  # Extract mean of latent space distribution
+        latent_trajectory = z_mean  # Store the result
+    
+        save_path = f"{model_path}/../latent_trajectory/toy_example/latent_trajectories_n_{i}.npy"
+        np.save(save_path, latent_trajectory)
 
 def log_prob(model, x, positional_dist, quaternion_dist, quaternion_dist_n):
     """Compute the log probability of quaternion vmf and position Guassian distributions
@@ -548,33 +802,37 @@ def plot(model, measure, mf, geodesic):
 
 
 if __name__ == "__main__":
-    # train = 0, visualization = 1
-    mode = 1
+    writer = SummaryWriter()
+
+    # train = 0, visualization = 1, save_latent_trajectory = 2, train_contract = 3
+    mode = 3
 
     trajectory_number = 7  # the number of total demonstration files
     test_id = 0  # the index of the demonstration used for testing
     n_samples = 1
-    epochs = 1000  # training Mean
-    epochs_rbf = 1000  # training Variance
+    epochs = 5000  # training Mean
+    epochs_rbf = 0  # training Variance
     repetitions = 1  # number of training
     encoder_scales = [1.0]  # predefined variance of the encoder
-    learning_rate = 1e-3  # learning rate
+    learning_rate = 1e-1  # learning rate
     graph_size = 100  # the number of graph nodes in each dimension
     dof = 5  # number of dimensions (input output vector size)
     pos_dof = 2  # number of dimensions in the position data
     qua_dof = 3  # number of dimensions in the orientation data
     latent_max = 10  # metric visualization max/min. should be equal to Latent_max in auxilary_tests_toy_example.py
     batch_size = 128  # training batch size
-    trajectory_length = 135  # number of points in each trajectory
+    trajectory_length = 200  # number of points in each trajectory # MODIFIED : 135 -> 200
 
     r2_letter = "J"
     s2_letter = "C"
     loss = "elbo"
     model_path = '../models'
-    device = 'cpu'
+    device = 'cuda'
     input_data = np.zeros((trajectory_number, trajectory_length))
     name = "_delete_no_obstacles"
     trajectory_flatten = None
+    trajectory_list = []
+    trajectory_list_n = []
     plot_num = "0"
 
     for i in range(trajectory_number):
@@ -583,7 +841,7 @@ if __name__ == "__main__":
         s2_file_test = "../Dataset/letter_" + s2_letter + "_S2_" + str(test_id) + ".p"
         s2_file = "../Dataset/letter_" + s2_letter + "_S2_" + str(i) + ".p"
 
-        test_traj = pickle.load(open(r2_file, "rb"), encoding="latin1").transpose()
+        test_traj = pickle.load(open(r2_file_test, "rb"), encoding="latin1").transpose() # MODIFIED : r2_file -> r2_file_test
         trajectory = pickle.load(open(r2_file, "rb"), encoding="latin1").transpose()
         test_trajectory_qua = -pickle.load(open(s2_file_test, "rb"), encoding="latin1")
         trajectory_qua = pickle.load(open(s2_file, "rb"), encoding="latin1")
@@ -593,6 +851,8 @@ if __name__ == "__main__":
         trajectory_n = np.append(trajectory_n, -trajectory_qua, 1)
         test_traj = np.append(test_traj, test_trajectory_qua, 1)
 
+        trajectory_list.append(trajectory)
+        trajectory_list_n.append(trajectory_n)
         if i > 0:
             trajectory_flatten = np.vstack([trajectory_flatten, trajectory])
             trajectory_flatten = np.vstack([trajectory_flatten, trajectory_n])  # -Q for training
@@ -601,6 +861,9 @@ if __name__ == "__main__":
             trajectory_flatten = np.vstack([trajectory_flatten, trajectory_n])  # -Q for training
 
     input_data = trajectory_flatten[:, 0:dof]
+
+    trajectory_stacked = np.stack(trajectory_list, axis=0)
+    trajectory_stacked_n = np.stack(trajectory_list_n, axis=0)
 
     train_data = torch.utils.data.TensorDataset(torch.from_numpy(input_data).float())
     x_train, x_test = train_test_split(train_data, test_size=0.3)
@@ -612,3 +875,9 @@ if __name__ == "__main__":
         train_model()
     elif mode == 1:
         test_model()
+    elif mode == 2:
+        save_latent_trajectory()
+    elif mode == 3:
+        train_contract_model()
+    
+    writer.close()

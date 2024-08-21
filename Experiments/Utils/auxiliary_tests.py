@@ -70,7 +70,7 @@ class Tests:
         goal_index = -1
         p0 = self.model.encode(torch.tensor(ref_trajectory[0][0]).float(), train_rbf=True)[1]
         p1 = self.model.encode(torch.tensor(ref_trajectory[0][goal_index]).float(), train_rbf=True)[1]
-
+        
         # Compute geodesic between p0 and p1
         curve = discrete_model.connecting_geodesic(p0.view(1, -1), p1.view(1, -1), self.model, self.model.time_step)
 
